@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.5", features = ["trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = "0.25"
+ndarray = "0.15"
+anyhow = "1"
+
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["cuda", "load-dynamic", "ndarray"] }
 
 [profile.release]
 opt-level = 3
