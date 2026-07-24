@@ -10,10 +10,10 @@ tower-http = { version = "0.5", features = ["trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 image = "0.25"
-ndarray = "0.15"
+ndarray = "0.17"
 anyhow = "1"
 
-ort = { version = "=2.0.0-rc.11", default-features = false, features = ["cuda", "load-dynamic", "ndarray"] }
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["std", "cuda", "load-dynamic", "tls-rustls", "ndarray"] }
 
 [profile.release]
 opt-level = 3
