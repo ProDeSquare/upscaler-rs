@@ -1,0 +1,24 @@
+services:
+  realesrgan-api:
+    build: .
+    image: realesrgan-api:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the model read-only rather than baking it into the image -
+      # faster iteration, and keeps the image lean.
+      - ./models:/app/models:ro
+    environment:
+      - MODEL_PATH=/app/models/RealESRGAN_x4plus_anime_6B.onnx
+      - RUST_LOG=info
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Older Docker/compose without the Compose GPU spec above can instead use:
+    # runtime: nvidia
+    # environment:
+    #   - NVIDIA_VISIBLE_DEVICES=all
