@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
+use tokio::sync::Semaphore;
 
 use axum::{
     Router,
@@ -22,9 +23,11 @@ use tracing_subscriber::EnvFilter;
 const MODEL_PATH_ENV: &str = "MODEL_PATH";
 const DEFAULT_MODEL_PATH: &str = "/app/models/RealESRGAN_x4plus_anime_6B.onnx";
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+const MAX_CONCURRENT_WORKERS: usize = 1;
 
 struct AppState {
-    session: Mutex<Session>,
+    sessions: Mutex<Vec<Session>>,
+    semaphore: Semaphore,
 }
 
 #[tokio::main]
@@ -44,30 +47,24 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("CUDA execution provider is not available in this container.");
     }
 
-    tracing::info!(model_path, "loading model");
-    let session = Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_execution_providers([cuda.build().error_on_failure()])?
-        .commit_from_file(&model_path)?;
+    tracing::info!(model_path, workers = MAX_CONCURRENT_WORKERS, "loading models");
 
-    let input_names: Vec<String> = session
-        .inputs()
-        .iter()
-        .map(|i| i.name().to_string())
-        .collect();
-    let output_names: Vec<String> = session
-        .outputs()
-        .iter()
-        .map(|o| o.name().to_string())
-        .collect();
+    let mut sessions = Vec::with_capacity(MAX_CONCURRENT_WORKERS);
+    for _ in 0..MAX_CONCURRENT_WORKERS {
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
+            .commit_from_file(&model_path)?;
+        sessions.push(session);
+    }
+
     tracing::info!(
-        ?input_names,
-        ?output_names,
-        "model loaded, GPU execution provider active"
+        "models loaded, GPU execution provider active for all workers"
     );
 
     let state = Arc::new(AppState {
-        session: Mutex::new(session),
+        sessions: Mutex::new(sessions),
+        semaphore: Semaphore::new(MAX_CONCURRENT_WORKERS),
     });
 
     let app = Router::new()
@@ -104,7 +101,23 @@ async fn upscale(State(state): State<Arc<AppState>>, mut multipart: Multipart) -
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || run_upscale(&state.session, &bytes)).await;
+    let _permit = match state.semaphore.acquire().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("failed to acquire semaphore permit: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal concurrency error").into_response();
+        }
+    };
+
+    let result = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || {
+            let mut session = state.sessions.lock().unwrap().pop().expect("permit ensures session availability");
+            let res = run_upscale(&mut session, &bytes);
+            state.sessions.lock().unwrap().push(session);
+            res
+        }
+    }).await;
 
     match result {
         Ok(Ok(png_bytes)) => (
@@ -128,7 +141,7 @@ async fn upscale(State(state): State<Arc<AppState>>, mut multipart: Multipart) -
     }
 }
 
-fn run_upscale(session: &Mutex<Session>, input_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn run_upscale(session: &mut Session, input_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     let start = Instant::now();
 
     let img = image::load_from_memory(input_bytes)?.to_rgb8();
@@ -142,9 +155,8 @@ fn run_upscale(session: &Mutex<Session>, input_bytes: &[u8]) -> anyhow::Result<V
     let out_h = h * scale;
     let mut out_img = image::RgbImage::new(out_w, out_h);
 
-    let mut session_lock = session.lock().expect("session mutex poisoned");
-    let input_name = session_lock.inputs()[0].name().to_string();
-    let output_name = session_lock.outputs()[0].name().to_string();
+    let input_name = session.inputs()[0].name().to_string();
+    let output_name = session.outputs()[0].name().to_string();
 
     for tile_y in (0..h).step_by(tile_size as usize) {
         for tile_x in (0..w).step_by(tile_size as usize) {
@@ -168,7 +180,7 @@ fn run_upscale(session: &Mutex<Session>, input_bytes: &[u8]) -> anyhow::Result<V
             }
 
             let input_tensor = ort::value::Tensor::from_array(input)?;
-            let outputs = session_lock.run(ort::inputs![input_name.as_str() => input_tensor])?;
+            let outputs = session.run(ort::inputs![input_name.as_str() => input_tensor])?;
 
             let (shape, out_slice) = outputs[output_name.as_str()].try_extract_tensor::<f32>()?;
             let (out_tensor_h, out_tensor_w) = (shape[2] as usize, shape[3] as usize);
