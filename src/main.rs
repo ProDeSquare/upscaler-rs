@@ -21,9 +21,8 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 use tracing_subscriber::EnvFilter;
 
 const MODEL_PATH_ENV: &str = "MODEL_PATH";
-const DEFAULT_MODEL_PATH: &str = "/app/models/RealESRGAN_x4plus_anime_6B.onnx";
+const DEFAULT_MODEL_PATH: &str = "./models/RealESRGAN_x4plus_anime_6B.onnx";
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-const NUM_WORKERS: usize = 1;
 
 struct WorkItem {
     bytes: Vec<u8>,
@@ -38,11 +37,28 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let env_path = "<ENV_PATH>";
+
+    match dotenvy::from_path(env_path) {
+        Ok(_) => println!("Successfully loaded app env: {}", env_path),
+        Err(e) => eprintln!("Warning failed to load env: {}: {}", env_path, e),
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let num_workers: usize = std::env::var("NUM_WORKERS")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse()
+        .expect("NUM_WORKERS must be a valid unsinged int");
+
+    let port: u16 = std::env::var("APP_PORT")
+        .unwrap_or_else(|_| "8377".to_string())
+        .parse()
+        .expect("APP_PORT must be a valid u16 int");
 
     let model_path =
         std::env::var(MODEL_PATH_ENV).unwrap_or_else(|_| DEFAULT_MODEL_PATH.to_string());
@@ -55,12 +71,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         model_path,
-        workers = NUM_WORKERS,
+        workers = num_workers,
         "Spawning inference workers"
     );
 
-    let mut workers = Vec::with_capacity(NUM_WORKERS);
-    for worker_id in 0..NUM_WORKERS {
+    let mut workers = Vec::with_capacity(num_workers);
+    for worker_id in 0..num_workers {
         let (tx, rx) = std::sync::mpsc::channel::<WorkItem>();
         let model_path = model_path.clone();
 
@@ -92,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = std::sync::Arc::new(AppState {
         workers,
-        free_workers: Mutex::new((0..NUM_WORKERS).collect()),
+        free_workers: Mutex::new((0..num_workers).collect()),
         free_notify: tokio::sync::Notify::new(),
     });
 
@@ -102,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8377));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -226,6 +242,7 @@ fn run_upscale(session: &mut Session, input_bytes: &[u8]) -> anyhow::Result<Vec<
             let outputs = session.run(ort::inputs![input_name.as_str() => input_tensor])?;
 
             let (shape, out_slice) = outputs[output_name.as_str()].try_extract_tensor::<f32>()?;
+            // let (out_tensor_h, out_tensor_w) = (shape[2] as usize, shape[3] as usize);
             let out_tensor_w = shape[3] as usize;
             let plane = (shape[2] as usize) * out_tensor_w;
 
