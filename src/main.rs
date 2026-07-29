@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
-use tokio::sync::Semaphore;
 
 use axum::{
     Router,
@@ -17,17 +16,24 @@ use ndarray::Array4;
 use ort::ep::CUDAExecutionProvider;
 use ort::ep::ExecutionProvider;
 use ort::session::{Session, builder::GraphOptimizationLevel};
-use tower_http::limit::RequestBodyLimitLayer;
+use tokio::sync::oneshot;
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
 use tracing_subscriber::EnvFilter;
 
 const MODEL_PATH_ENV: &str = "MODEL_PATH";
 const DEFAULT_MODEL_PATH: &str = "/app/models/RealESRGAN_x4plus_anime_6B.onnx";
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-const MAX_CONCURRENT_WORKERS: usize = 1;
+const NUM_WORKERS: usize = 1;
+
+struct WorkItem {
+    bytes: Vec<u8>,
+    respond_to: oneshot::Sender<anyhow::Result<Vec<u8>>>,
+}
 
 struct AppState {
-    sessions: Mutex<Vec<Session>>,
-    semaphore: Semaphore,
+    workers: Vec<std::sync::mpsc::Sender<WorkItem>>,
+    free_workers: Mutex<Vec<usize>>,
+    free_notify: tokio::sync::Notify,
 }
 
 #[tokio::main]
@@ -47,32 +53,56 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("CUDA execution provider is not available in this container.");
     }
 
-    tracing::info!(model_path, workers = MAX_CONCURRENT_WORKERS, "loading models");
-
-    let mut sessions = Vec::with_capacity(MAX_CONCURRENT_WORKERS);
-    for _ in 0..MAX_CONCURRENT_WORKERS {
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_execution_providers([CUDAExecutionProvider::default().build().error_on_failure()])?
-            .commit_from_file(&model_path)?;
-        sessions.push(session);
-    }
-
     tracing::info!(
-        "models loaded, GPU execution provider active for all workers"
+        model_path,
+        workers = NUM_WORKERS,
+        "Spawning inference workers"
     );
 
-    let state = Arc::new(AppState {
-        sessions: Mutex::new(sessions),
-        semaphore: Semaphore::new(MAX_CONCURRENT_WORKERS),
+    let mut workers = Vec::with_capacity(NUM_WORKERS);
+    for worker_id in 0..NUM_WORKERS {
+        let (tx, rx) = std::sync::mpsc::channel::<WorkItem>();
+        let model_path = model_path.clone();
+
+        std::thread::Builder::new()
+            .name(format!("ort-worker-{worker_id}"))
+            .spawn(move || {
+                let cuda_options = CUDAExecutionProvider::default().with_device_id(1);
+
+                let mut session = Session::builder()
+                    .expect("session builder")
+                    .with_optimization_level(GraphOptimizationLevel::Level3)
+                    .expect("opt level")
+                    .with_execution_providers([cuda_options.build().error_on_failure()])
+                    .expect("execution providers")
+                    .commit_from_file(&model_path)
+                    .expect("load model");
+
+                tracing::info!(worker_id, "working session loaded, entering serve loop");
+
+                while let Ok(item) = rx.recv() {
+                    let res = run_upscale(&mut session, &item.bytes);
+                    let _ = item.respond_to.send(res);
+                }
+            })
+            .expect("failed to spawn inference worker thread");
+
+        workers.push(tx);
+    }
+
+    let state = std::sync::Arc::new(AppState {
+        workers,
+        free_workers: Mutex::new((0..NUM_WORKERS).collect()),
+        free_notify: tokio::sync::Notify::new(),
     });
 
     let app = Router::new()
         .route("/upscale", post(upscale))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES))
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8377));
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -101,23 +131,35 @@ async fn upscale(State(state): State<Arc<AppState>>, mut multipart: Multipart) -
         }
     };
 
-    let _permit = match state.semaphore.acquire().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("failed to acquire semaphore permit: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal concurrency error").into_response();
+    let worker_idx = loop {
+        let maybe_idx = state.free_workers.lock().unwrap().pop();
+        match maybe_idx {
+            Some(idx) => break idx,
+            None => state.free_notify.notified().await,
         }
     };
 
-    let result = tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
-        move || {
-            let mut session = state.sessions.lock().unwrap().pop().expect("permit ensures session availability");
-            let res = run_upscale(&mut session, &bytes);
-            state.sessions.lock().unwrap().push(session);
-            res
-        }
-    }).await;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let item = WorkItem {
+        bytes: bytes.to_vec(),
+        respond_to: resp_tx,
+    };
+
+    if state.workers[worker_idx].send(item).is_err() {
+        state.free_workers.lock().unwrap().push(worker_idx);
+        state.free_notify.notify_one();
+
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "inference worker unavailable",
+        )
+            .into_response();
+    }
+
+    let result = resp_rx.await;
+
+    state.free_workers.lock().unwrap().push(worker_idx);
+    state.free_notify.notify_one();
 
     match result {
         Ok(Ok(png_bytes)) => (
@@ -151,6 +193,8 @@ fn run_upscale(session: &mut Session, input_bytes: &[u8]) -> anyhow::Result<Vec<
     let tile_size: u32 = 256;
     let tile_pad: u32 = 32;
 
+    let fixed_in_dim: usize = 320;
+
     let out_w = w * scale;
     let out_h = h * scale;
     let mut out_img = image::RgbImage::new(out_w, out_h);
@@ -168,8 +212,7 @@ fn run_upscale(session: &mut Session, input_bytes: &[u8]) -> anyhow::Result<Vec<
             let current_in_w = in_x_max - in_x_min;
             let current_in_h = in_y_max - in_y_min;
 
-            let mut input =
-                Array4::<f32>::zeros((1, 3, current_in_h as usize, current_in_w as usize));
+            let mut input = Array4::<f32>::zeros((1, 3, fixed_in_dim, fixed_in_dim));
             for dy in 0..current_in_h {
                 for dx in 0..current_in_w {
                     let px = img.get_pixel(in_x_min + dx, in_y_min + dy);
@@ -183,8 +226,8 @@ fn run_upscale(session: &mut Session, input_bytes: &[u8]) -> anyhow::Result<Vec<
             let outputs = session.run(ort::inputs![input_name.as_str() => input_tensor])?;
 
             let (shape, out_slice) = outputs[output_name.as_str()].try_extract_tensor::<f32>()?;
-            let (out_tensor_h, out_tensor_w) = (shape[2] as usize, shape[3] as usize);
-            let plane = out_tensor_h * out_tensor_w;
+            let out_tensor_w = shape[3] as usize;
+            let plane = (shape[2] as usize) * out_tensor_w;
 
             let out_x_min = tile_x * scale;
             let out_y_min = tile_y * scale;
