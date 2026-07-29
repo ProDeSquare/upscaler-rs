@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.5", features = ["trace", "limit"] }
+tower-http = { version = "0.5", features = ["trace", "limit", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 image = "0.25"
