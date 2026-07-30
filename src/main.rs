@@ -50,7 +50,6 @@ use tracing_subscriber::EnvFilter;
 const MODEL_PATH_ENV: &str = "MODEL_PATH";
 const DEFAULT_MODEL_PATH: &str = "./models/RealESRGAN_x4plus_anime_6B.onnx";
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-const IDLE_SHRINK_AFTER: Duration = Duration::from_secs(45);
 
 struct WorkItem {
     bytes: Vec<u8>,
@@ -77,6 +76,13 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let idle_shrink_secs: u64 = std::env::var("IDLE_SHRINK_AFTER")
+        .unwrap_or_else(|_| "120".to_string())
+        .parse()
+        .expect("IDLE_SHRINK_AFTER must be a valid u64 int");
+
+    let idle_shrink_after: Duration = Duration::from_secs(idle_shrink_secs);
 
     let num_workers: usize = std::env::var("NUM_WORKERS")
         .unwrap_or_else(|_| "3".to_string())
@@ -125,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(worker_id, "working session loaded, entering serve loop");
 
                 loop {
-                    match rx.recv_timeout(IDLE_SHRINK_AFTER) {
+                    match rx.recv_timeout(idle_shrink_after) {
                         Ok(item) => {
                             let res = run_upscale(&mut session, &item.bytes);
                             let _ = item.respond_to.send(res);
