@@ -90,11 +90,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut workers = Vec::with_capacity(num_workers);
+    let mut join_handles = Vec::with_capacity(num_workers);
+
     for worker_id in 0..num_workers {
         let (tx, rx) = std::sync::mpsc::channel::<WorkItem>();
         let model_path = model_path.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("ort-worker-{worker_id}"))
             .spawn(move || {
                 let cuda_options = CUDAExecutionProvider::default().with_device_id(1);
@@ -139,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
             .expect("failed to spawn inference worker thread");
 
         workers.push(tx);
+        join_handles.push(handle);
     }
 
     let state = std::sync::Arc::new(AppState {
@@ -151,12 +154,24 @@ async fn main() -> anyhow::Result<()> {
         .route("/upscale", post(upscale))
         .layer(RequestBodyLimitLayer::new(MAX_UPLOAD_BYTES))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    drop(state);
+
+    for handle in join_handles {
+        let _ = handle.join();
+    }
+
+    tracing::info!("All worker threads have shut down gracefully");
+
     Ok(())
 }
 
@@ -342,4 +357,31 @@ fn shrink_arena(session: &mut Session) -> anyhow::Result<()> {
     session.run_with_options(ort::inputs![input_name.as_str() => tensor], &run_options)?;
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {}
+    }
+
+    tracing::info!("Shutdown signal recieved");
+    tracing::info!("HTTP server stopped accepting incoming requests");
 }
