@@ -58,12 +58,12 @@ RUN chmod 750 /app/realesrgan-api
 
 # If you bake the model into the image instead of mounting it at runtime,
 # uncomment this and make sure the file is readable-only by appuser:
-# COPY --chown=appuser:appuser models/RealESRGAN_x4plus_anime_6B.onnx /app/models/
-# RUN chmod 640 /app/models/RealESRGAN_x4plus_anime_6B.onnx
+# COPY --chown=appuser:appuser models/<MODEL_NAME> /app/models/
+# RUN chmod 640 /app/models/<MODEL_NAME>
 
 USER appuser
 
-ENV MODEL_PATH=/app/models/RealESRGAN_x4plus_anime_6B.onnx
+ENV MODEL_PATH=/app/models/<MODEL_NAME>
 ENV RUST_LOG=info
 
 EXPOSE 8080
